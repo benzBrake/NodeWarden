@@ -1,10 +1,16 @@
 // Environment bindings
 export interface Env {
   DB: D1Database;
-  ATTACHMENTS: R2Bucket;
+  // Prefer R2 when available. Optional to support KV-only deployments.
+  ATTACHMENTS?: R2Bucket;
+  // Optional fallback for attachment/send file storage (no credit card required).
+  ATTACHMENTS_KV?: KVNamespace;
   JWT_SECRET: string;
   TOTP_SECRET?: string;
 }
+
+export type UserRole = 'admin' | 'user';
+export type UserStatus = 'active' | 'banned';
 
 // Sample JWT secret used by `.dev.vars.example`.
 // If runtime JWT_SECRET equals this value, treat it as unsafe.
@@ -34,8 +40,32 @@ export interface User {
   kdfMemory?: number;
   kdfParallelism?: number;
   securityStamp: string;
+  role: UserRole;
+  status: UserStatus;
+  totpSecret: string | null;
+  totpRecoveryCode: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface Invite {
+  code: string;
+  createdBy: string;
+  usedBy: string | null;
+  expiresAt: string;
+  status: 'active' | 'used' | 'revoked' | 'expired';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuditLog {
+  id: string;
+  actorUserId: string | null;
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  metadata: string | null;
+  createdAt: string;
 }
 
 // Cipher types
@@ -157,6 +187,68 @@ export interface Device {
   updatedAt: string;
 }
 
+export interface TrustedDeviceTokenSummary {
+  deviceIdentifier: string;
+  expiresAt: number;
+  tokenCount: number;
+}
+
+export enum SendType {
+  Text = 0,
+  File = 1,
+}
+
+export enum SendAuthType {
+  Email = 0,
+  Password = 1,
+  None = 2,
+}
+
+export interface Send {
+  id: string;
+  userId: string;
+  type: SendType;
+  name: string;
+  notes: string | null;
+  data: string;
+  key: string;
+  passwordHash: string | null;
+  passwordSalt: string | null;
+  passwordIterations: number | null;
+  authType: SendAuthType;
+  emails: string | null;
+  maxAccessCount: number | null;
+  accessCount: number;
+  disabled: boolean;
+  hideEmail: boolean | null;
+  createdAt: string;
+  updatedAt: string;
+  expirationDate: string | null;
+  deletionDate: string;
+}
+
+export interface SendResponse {
+  id: string;
+  accessId: string;
+  type: number;
+  name: string;
+  notes: string | null;
+  text: any | null;
+  file: any | null;
+  key: string;
+  maxAccessCount: number | null;
+  accessCount: number;
+  password: string | null;
+  emails: string | null;
+  authType: SendAuthType;
+  disabled: boolean;
+  hideEmail: boolean | null;
+  revisionDate: string;
+  expirationDate: string | null;
+  deletionDate: string;
+  object: string;
+}
+
 // JWT Payload
 export interface JWTPayload {
   sub: string;      // user id
@@ -235,6 +327,8 @@ export interface ProfileResponse {
   forcePasswordReset: boolean;
   avatarColor: string | null;
   creationDate: string;
+  role?: UserRole;
+  status?: UserStatus;
   object: string;
 }
 
@@ -290,7 +384,7 @@ export interface SyncResponse {
   ciphers: CipherResponse[];
   domains: any;
   policies: any[];
-  sends: any[];
+  sends: SendResponse[];
   // PascalCase for desktop/browser clients
   UserDecryptionOptions: UserDecryptionOptions | null;
   // camelCase for Android client (SyncResponseJson uses @SerialName("userDecryption"))

@@ -7,21 +7,39 @@ import { LIMITS } from '../config/limits';
 import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
 import { createRefreshToken } from '../utils/jwt';
 import { readAuthRequestDeviceInfo } from '../utils/device';
+import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
+import { issueSendAccessToken } from './sends';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
 const TWO_FACTOR_PROVIDER_REMEMBER = 5;
+// Android client (2026.2.x) deserializes TwoFactorProviders2 keys with -1 for recovery code.
+// Keep request parsing backward-compatible with historical provider values (8 / 100).
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE = '-1';
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY = 8;
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST = 100;
 
-function twoFactorRequiredResponse(message: string = 'Two factor required.'): Response {
+function resolveTotpSecret(userSecret: string | null): string | null {
+  if (userSecret && isTotpEnabled(userSecret)) {
+    return userSecret;
+  }
+  return null;
+}
+
+function twoFactorRequiredResponse(message: string = 'Two factor required.', includeRecoveryCode: boolean = false): Response {
+  const providers = includeRecoveryCode
+    ? [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR), TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE]
+    : [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)];
+  const providers2: Record<string, null> = {};
+  for (const provider of providers) providers2[provider] = null;
+
   // Bitwarden clients rely on these fields to trigger the 2FA UI flow.
   return jsonResponse(
     {
       error: 'invalid_grant',
       error_description: message,
-      TwoFactorProviders: [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)],
-      TwoFactorProviders2: {
-        [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)]: null,
-      },
+      TwoFactorProviders: providers,
+      TwoFactorProviders2: providers2,
       // Required by current Android parser (nullable value is acceptable).
       SsoEmail2faSessionToken: null,
       // Keep payload shape close to upstream implementations.
@@ -88,6 +106,10 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
   }
 
   const grantType = body.grant_type;
+  const clientIdentifier = getClientIdentifier(request);
+  if (!clientIdentifier) {
+    return identityErrorResponse('Client IP is required', 'invalid_request', 403);
+  }
 
   if (grantType === 'password') {
     // Login with password
@@ -96,7 +118,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     const twoFactorToken = body.twoFactorToken;
     const twoFactorProvider = body.twoFactorProvider;
     const twoFactorRemember = body.twoFactorRemember;
-    const loginIdentifier = getClientIdentifier(request);
+    const loginIdentifier = `${clientIdentifier}:${email}`;
     const deviceInfo = readAuthRequestDeviceInfo(body, request);
 
     if (!email || !passwordHash) {
@@ -119,8 +141,12 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       await rateLimit.recordFailedLogin(loginIdentifier);
       return identityErrorResponse('Username or password is incorrect. Try again', 'invalid_grant', 400);
     }
+    if (user.status !== 'active') {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      return identityErrorResponse('Account is disabled', 'invalid_grant', 400);
+    }
 
-    const valid = await auth.verifyPassword(passwordHash, user.masterPasswordHash);
+    const valid = await auth.verifyPassword(passwordHash, user.masterPasswordHash, user.email);
     if (!valid) {
       return recordFailedLoginAndBuildResponse(
         rateLimit,
@@ -129,28 +155,25 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       );
     }
 
-    // Optional 2FA: enabled only when TOTP_SECRET is configured in Workers env.
+    // Optional 2FA: enabled only by per-user secret.
     let trustedTwoFactorTokenToReturn: string | undefined;
-    if (isTotpEnabled(env.TOTP_SECRET)) {
+    const effectiveTotpSecret = resolveTotpSecret(user.totpSecret);
+    if (effectiveTotpSecret) {
+      const canUseRecoveryCode = !!user.totpRecoveryCode;
       const normalizedTwoFactorProvider = String(twoFactorProvider ?? '').trim();
       const normalizedTwoFactorToken = String(twoFactorToken ?? '').trim();
-      const rememberRequested = ['1', 'true', 'True', 'TRUE', 'on', 'yes', 'Yes', 'YES'].includes(String(twoFactorRemember || '').trim());
+      let rememberRequested = ['1', 'true', 'True', 'TRUE', 'on', 'yes', 'Yes', 'YES'].includes(String(twoFactorRemember || '').trim());
       const hasProvider = normalizedTwoFactorProvider.length > 0;
       const hasToken = normalizedTwoFactorToken.length > 0;
 
       // Upstream-compatible behavior: if 2FA is required and either provider or token is missing,
       // respond with a 2FA challenge payload.
       if (!hasProvider || !hasToken) {
-        return twoFactorRequiredResponse();
-      }
-
-      const parsedProvider = Number.parseInt(normalizedTwoFactorProvider, 10);
-      if (!Number.isFinite(parsedProvider)) {
-        return twoFactorRequiredResponse();
+        return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
       }
 
       let passedByRememberToken = false;
-      if (parsedProvider === TWO_FACTOR_PROVIDER_REMEMBER) {
+      if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_REMEMBER)) {
         if (deviceInfo.deviceIdentifier) {
           const trustedUserId = await storage.getTrustedTwoFactorDeviceTokenUserId(
             normalizedTwoFactorToken,
@@ -161,13 +184,27 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
         // Remember token missing/invalid/expired should re-enter the 2FA challenge flow.
         if (!passedByRememberToken) {
-          return twoFactorRequiredResponse();
+          return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
         }
-      } else if (parsedProvider === TWO_FACTOR_PROVIDER_AUTHENTICATOR) {
-        const totpOk = await verifyTotpToken(env.TOTP_SECRET!, normalizedTwoFactorToken);
+      } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)) {
+        const totpOk = await verifyTotpToken(effectiveTotpSecret, normalizedTwoFactorToken);
         if (!totpOk) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
+      } else if (
+        normalizedTwoFactorProvider === TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE ||
+        normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY) ||
+        normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST)
+      ) {
+        if (!recoveryCodeEquals(normalizedTwoFactorToken, user.totpRecoveryCode)) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        user.totpSecret = null;
+        user.totpRecoveryCode = createRecoveryCode();
+        user.updatedAt = new Date().toISOString();
+        await storage.saveUser(user);
+        await storage.deleteRefreshTokensByUserId(user.id);
+        rememberRequested = false;
       } else {
         // Unsupported provider for this server profile behaves as an invalid 2FA attempt.
         return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
@@ -232,7 +269,69 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
     return jsonResponse(response);
 
+  } else if (grantType === 'send_access') {
+    const sendAccessLimit = await rateLimit.consumeBudget(`${clientIdentifier}:public`, LIMITS.rateLimit.publicRequestsPerMinute);
+    if (!sendAccessLimit.allowed) {
+      return identityErrorResponse(
+        `Rate limit exceeded. Try again in ${sendAccessLimit.retryAfterSeconds} seconds.`,
+        'TooManyRequests',
+        429
+      );
+    }
+
+    const sendId = String(body.send_id || body.sendId || '').trim();
+    if (!sendId) {
+      return jsonResponse(
+        {
+          error: 'invalid_request',
+          error_description: 'send_id is required',
+          send_access_error_type: 'invalid_send_id',
+          ErrorModel: {
+            Message: 'send_id is required',
+            Object: 'error',
+          },
+        },
+        400
+      );
+    }
+
+    const passwordHashB64 = String(
+      body.password_hash_b64 || body.passwordHashB64 || body.passwordHash || body.password_hash || ''
+    ).trim() || null;
+    const password = String(body.password || '').trim() || null;
+
+    const result = await issueSendAccessToken(
+      env,
+      sendId,
+      passwordHashB64,
+      password,
+      rateLimit,
+      `${clientIdentifier}:send-password`
+    );
+    if ('error' in result) {
+      return result.error;
+    }
+
+    return jsonResponse({
+      access_token: result.token,
+      expires_in: LIMITS.auth.sendAccessTokenTtlSeconds,
+      token_type: 'Bearer',
+      scope: 'api.send',
+      unofficialServer: true,
+    });
   } else if (grantType === 'refresh_token') {
+    const refreshLimit = await rateLimit.consumeBudget(
+      `${clientIdentifier}:identity-refresh`,
+      LIMITS.rateLimit.refreshTokenRequestsPerMinute
+    );
+    if (!refreshLimit.allowed) {
+      return identityErrorResponse(
+        `Rate limit exceeded. Try again in ${refreshLimit.retryAfterSeconds} seconds.`,
+        'TooManyRequests',
+        429
+      );
+    }
+
     // Refresh token
     const refreshToken = body.refresh_token;
     if (!refreshToken) {
@@ -314,8 +413,10 @@ export async function handlePrelogin(request: Request, env: Env): Promise<Respon
   // Return default KDF settings even if user doesn't exist (to prevent user enumeration)
   const kdfType = user?.kdfType ?? 0;
   const kdfIterations = user?.kdfIterations ?? LIMITS.auth.defaultKdfIterations;
-  const kdfMemory = user?.kdfMemory;
-  const kdfParallelism = user?.kdfParallelism;
+  // Use ?? null so non-existent users return null (not undefined/omitted) for these fields,
+  // matching the response shape of real PBKDF2 users and reducing enumeration signal.
+  const kdfMemory = user?.kdfMemory ?? null;
+  const kdfParallelism = user?.kdfParallelism ?? null;
 
   return jsonResponse({
     kdf: kdfType,

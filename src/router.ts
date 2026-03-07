@@ -1,5 +1,6 @@
 import { Env, DEFAULT_DEV_SECRET } from './types';
 import { AuthService } from './services/auth';
+import { StorageService } from './services/storage';
 import { RateLimitService, getClientIdentifier } from './services/ratelimit';
 import { handleCors, errorResponse, jsonResponse } from './utils/response';
 import { LIMITS } from './config/limits';
@@ -8,7 +9,18 @@ import { LIMITS } from './config/limits';
 import { handleToken, handlePrelogin, handleRevocation } from './handlers/identity';
 
 // Account handlers
-import { handleRegister, handleGetProfile, handleUpdateProfile, handleSetKeys, handleGetRevisionDate, handleVerifyPassword } from './handlers/accounts';
+import {
+  handleRegister,
+  handleGetProfile,
+  handleSetKeys,
+  handleGetRevisionDate,
+  handleVerifyPassword,
+  handleChangePassword,
+  handleGetTotpStatus,
+  handleSetTotpStatus,
+  handleGetTotpRecoveryCode,
+  handleRecoverTwoFactor,
+} from './handlers/accounts';
 
 // Cipher handlers
 import { 
@@ -33,12 +45,39 @@ import {
   handleDeleteFolder 
 } from './handlers/folders';
 
+// Send handlers
+import {
+  handleGetSends,
+  handleGetSend,
+  handleCreateSend,
+  handleCreateFileSendV2,
+  handleGetSendFileUpload,
+  handleUploadSendFile,
+  handleUpdateSend,
+  handleDeleteSend,
+  handleRemoveSendPassword,
+  handleRemoveSendAuth,
+  handleAccessSend,
+  handleAccessSendFile,
+  handleAccessSendV2,
+  handleAccessSendFileV2,
+  handleDownloadSendFile,
+} from './handlers/sends';
+
 // Sync handler
 import { handleSync } from './handlers/sync';
 
 // Setup handlers
-import { handleSetupPage, handleSetupStatus } from './handlers/setup';
-import { handleKnownDevice, handleGetDevices, handleUpdateDeviceToken } from './handlers/devices';
+import { handleSetupStatus } from './handlers/setup';
+import {
+  handleKnownDevice,
+  handleGetAuthorizedDevices,
+  handleGetDevices,
+  handleRevokeAllTrustedDevices,
+  handleRevokeTrustedDevice,
+  handleDeleteDevice,
+  handleUpdateDeviceToken
+} from './handlers/devices';
 
 // Import handler
 import { handleCiphersImport } from './handlers/import';
@@ -51,6 +90,15 @@ import {
   handleDeleteAttachment,
   handlePublicDownloadAttachment,
 } from './handlers/attachments';
+import {
+  handleAdminListUsers,
+  handleAdminCreateInvite,
+  handleAdminListInvites,
+  handleAdminDeleteAllInvites,
+  handleAdminRevokeInvite,
+  handleAdminSetUserStatus,
+  handleAdminDeleteUser,
+} from './handlers/admin';
 
 function isSameOriginWriteRequest(request: Request): boolean {
   const targetOrigin = new URL(request.url).origin;
@@ -70,6 +118,14 @@ function isSameOriginWriteRequest(request: Request): boolean {
 
   // Require browser-origin evidence for setup/register write operations.
   return false;
+}
+
+function jwtSecretUnsafeReason(env: Env): 'missing' | 'default' | 'too_short' | null {
+  const secret = (env.JWT_SECRET || '').trim();
+  if (!secret) return 'missing';
+  if (secret === DEFAULT_DEV_SECRET) return 'default';
+  if (secret.length < LIMITS.auth.jwtSecretMinLength) return 'too_short';
+  return null;
 }
 
 function getNwIconSvg(): string {
@@ -157,6 +213,38 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  const clientId = getClientIdentifier(request);
+
+  async function enforcePublicRateLimit(
+    category: string = 'public',
+    maxRequests: number = LIMITS.rateLimit.publicRequestsPerMinute
+  ): Promise<Response | null> {
+    if (!clientId) {
+      return new Response(JSON.stringify({
+        error: 'Forbidden',
+        error_description: 'Client IP is required',
+      }), {
+        status: 403,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+    }
+    const rateLimit = new RateLimitService(env.DB);
+    const check = await rateLimit.consumeBudget(`${clientId}:${category}`, maxRequests);
+    if (check.allowed) return null;
+    return new Response(JSON.stringify({
+      error: 'Too many requests',
+      error_description: `Rate limit exceeded. Try again in ${check.retryAfterSeconds} seconds.`,
+    }), {
+      status: 429,
+      headers: {
+        'Content-Type': 'application/json',
+        'Retry-After': String(check.retryAfterSeconds || 60),
+        'X-RateLimit-Remaining': '0',
+      },
+    });
+  }
 
   // Handle CORS preflight
   if (method === 'OPTIONS') {
@@ -166,14 +254,35 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   // Route matching
   try {
 
-    // Setup page (root)
-    if (path === '/' && method === 'GET') {
-      return handleSetupPage(request, env);
+    // Reject oversized bodies before any path-specific parsing.
+    // File upload paths enforce their own limits and are exempt here.
+    const isFileUploadPath =
+      /^\/api\/ciphers\/[a-f0-9-]+\/attachment\/[a-f0-9-]+$/i.test(path) ||
+      /^\/api\/sends\/[a-f0-9-]+\/file\/[a-f0-9-]+$/i.test(path);
+    if (!isFileUploadPath) {
+      const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
+      if (contentLength > LIMITS.request.maxBodyBytes) {
+        return errorResponse('Request body too large', 413);
+      }
     }
 
     // Setup status
     if (path === '/setup/status' && method === 'GET') {
+      const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+      if (blocked) return blocked;
       return handleSetupStatus(request, env);
+    }
+
+    // Web runtime config for static client bootstrap
+    if (path === '/api/web/config' && method === 'GET') {
+      const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+      if (blocked) return blocked;
+      const jwtUnsafeReason = jwtSecretUnsafeReason(env);
+      return jsonResponse({
+        defaultKdfIterations: LIMITS.auth.defaultKdfIterations,
+        jwtUnsafeReason,
+        jwtSecretMinLength: LIMITS.auth.jwtSecretMinLength,
+      });
     }
 
     // Browser/devtools probe endpoint
@@ -207,14 +316,44 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return handlePublicDownloadAttachment(request, env, cipherId, attachmentId);
     }
 
-    // Notifications hub (stub - no auth required, return 200 for connection)
-    if (path.startsWith('/notifications/')) {
-      return new Response(null, { status: 200 });
+    // Public Send access endpoints
+    const sendAccessMatch = path.match(/^\/api\/sends\/access\/([^/]+)$/i);
+    if (sendAccessMatch && method === 'POST') {
+      const blocked = await enforcePublicRateLimit();
+      if (blocked) return blocked;
+      const accessId = sendAccessMatch[1];
+      return handleAccessSend(request, env, accessId);
     }
 
-    // Known device check (no auth required)
-    if (path === '/api/devices/knowndevice' && method === 'GET') {
-      return handleKnownDevice(request, env);
+    const sendAccessV2Match = path === '/api/sends/access';
+    if (sendAccessV2Match && method === 'POST') {
+      const blocked = await enforcePublicRateLimit();
+      if (blocked) return blocked;
+      return handleAccessSendV2(request, env);
+    }
+
+    const sendAccessFileV2Match = path.match(/^\/api\/sends\/access\/file\/([^/]+)\/?$/i);
+    if (sendAccessFileV2Match && method === 'POST') {
+      const blocked = await enforcePublicRateLimit();
+      if (blocked) return blocked;
+      const fileId = sendAccessFileV2Match[1];
+      return handleAccessSendFileV2(request, env, fileId);
+    }
+
+    const sendAccessFileMatch = path.match(/^\/api\/sends\/([^/]+)\/access\/file\/([^/]+)\/?$/i);
+    if (sendAccessFileMatch && method === 'POST') {
+      const blocked = await enforcePublicRateLimit();
+      if (blocked) return blocked;
+      const idOrAccessId = sendAccessFileMatch[1];
+      const fileId = sendAccessFileMatch[2];
+      return handleAccessSendFile(request, env, idOrAccessId, fileId);
+    }
+
+    const sendDownloadMatch = path.match(/^\/api\/sends\/([^/]+)\/([^/]+)\/?$/i);
+    if (sendDownloadMatch && method === 'GET') {
+      const sendId = sendDownloadMatch[1];
+      const fileId = sendDownloadMatch[2];
+      return handleDownloadSendFile(request, env, sendId, fileId);
     }
 
     // Identity endpoints (no auth required)
@@ -222,12 +361,27 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return handleToken(request, env);
     }
 
+    // Known device check (no auth required).
+    if (path === '/api/devices/knowndevice' && method === 'GET') {
+      const blocked = await enforcePublicRateLimit();
+      if (blocked) return jsonResponse(false);
+      return handleKnownDevice(request, env);
+    }
+
     if ((path === '/identity/connect/revocation' || path === '/identity/connect/revoke') && method === 'POST') {
+      const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
+      if (blocked) return blocked;
       return handleRevocation(request, env);
     }
 
     if (path === '/identity/accounts/prelogin' && method === 'POST') {
+      const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
+      if (blocked) return blocked;
       return handlePrelogin(request, env);
+    }
+
+    if ((path === '/identity/accounts/recover-2fa' || path === '/api/accounts/recover-2fa') && method === 'POST') {
+      return handleRecoverTwoFactor(request, env);
     }
 
     // Config endpoint (no auth required for basic config)
@@ -235,6 +389,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // They also tolerate different casing, but their response models use PascalCase.
     const isConfigRequest = (path === '/config' || path === '/api/config') && method === 'GET';
     if (isConfigRequest) {
+      const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+      if (blocked) return blocked;
       const origin = url.origin;
       return jsonResponse({
         // ── Version Strategy (Plan E) ──────────────────────────────────────
@@ -266,6 +422,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         featureStates: {
           'duo-redirect': true,
           'email-verification': true,
+          'pm-19051-send-email-verification': false,
           'unauth-ui-refresh': true,
         },
         object: 'config',
@@ -274,11 +431,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     // Version endpoint (some clients probe this to validate the server)
     if (path === '/api/version' && method === 'GET') {
+      const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
+      if (blocked) return blocked;
       return jsonResponse(LIMITS.compatibility.bitwardenServerVersion);  // Always same value as /config.version
     }
 
-    // Registration endpoint (no auth required, but only works once)
+    // Registration endpoint (no auth required):
+    // - first user can self-register and becomes admin
+    // - later registrations require inviteCode in request body
     if (path === '/api/accounts/register' && method === 'POST') {
+      const blocked = await enforcePublicRateLimit('register', LIMITS.rateLimit.registerRequestsPerMinute);
+      if (blocked) return blocked;
       if (!isSameOriginWriteRequest(request)) {
         return errorResponse('Forbidden origin', 403);
       }
@@ -286,8 +449,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     // If JWT_SECRET is not safely configured, block any other endpoints.
-    const secret = (env.JWT_SECRET || '').trim();
-    if (!secret || secret.length < LIMITS.auth.jwtSecretMinLength || secret === DEFAULT_DEV_SECRET) {
+    const secret = jwtSecretUnsafeReason(env);
+    if (secret) {
       return errorResponse('Server configuration error: JWT_SECRET is not set or too weak', 500);
     }
 
@@ -301,33 +464,21 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     const userId = payload.sub;
-    const clientId = getClientIdentifier(request);
-
-    // Dedicated read rate limiting for heavy sync endpoint.
-    if (path === '/api/sync' && method === 'GET') {
-      const rateLimit = new RateLimitService(env.DB);
-      const rateLimitCheck = await rateLimit.consumeSyncReadBudget(userId + ':' + clientId + ':sync');
-
-      if (!rateLimitCheck.allowed) {
-        return new Response(JSON.stringify({
-          error: 'Too many requests',
-          error_description: `Sync rate limit exceeded. Try again in ${rateLimitCheck.retryAfterSeconds} seconds.`,
-        }), {
-          status: 429,
-          headers: {
-            'Content-Type': 'application/json',
-            'Retry-After': rateLimitCheck.retryAfterSeconds!.toString(),
-            'X-RateLimit-Remaining': '0',
-          },
-        });
-      }
+    const storage = new StorageService(env.DB);
+    const currentUser = await storage.getUserById(userId);
+    if (!currentUser) {
+      return errorResponse('Unauthorized', 401);
     }
-
-    // API rate limiting only for write operations (keep reads frictionless)
-    const isWriteMethod = method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH';
-    if (isWriteMethod) {
+    if (currentUser.status !== 'active') {
+      return errorResponse('Account is disabled', 403);
+    }
+    // Unified rate limiting for all authenticated API requests.
+    {
       const rateLimit = new RateLimitService(env.DB);
-      const rateLimitCheck = await rateLimit.consumeApiWriteBudget(userId + ':' + clientId + ':write');
+      const rateLimitCheck = await rateLimit.consumeBudget(
+        userId + ':api',
+        LIMITS.rateLimit.apiRequestsPerMinute
+      );
 
       if (!rateLimitCheck.allowed) {
         return new Response(JSON.stringify({
@@ -344,30 +495,40 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
     }
 
-    // Block account operations that could change password or delete user
+    // Block account operations we do not support yet.
     if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
       const blockedAccountPaths = new Set([
-        '/api/accounts/password',
-        '/api/accounts/change-password',
         '/api/accounts/set-password',
-        '/api/accounts/master-password',
         '/api/accounts/delete',
         '/api/accounts/delete-account',
         '/api/accounts/delete-vault',
       ]);
       if (blockedAccountPaths.has(path)) {
-        return errorResponse('Not implemented in single-user mode', 501);
+        return errorResponse('Not implemented', 501);
       }
     }
 
     // Account endpoints
     if (path === '/api/accounts/profile') {
       if (method === 'GET') return handleGetProfile(request, env, userId);
-      if (method === 'PUT') return handleUpdateProfile(request, env, userId);
+      return errorResponse('Method not allowed', 405);
+    }
+
+    if ((path === '/api/accounts/password' || path === '/api/accounts/change-password') && (method === 'POST' || method === 'PUT')) {
+      return handleChangePassword(request, env, userId);
     }
 
     if (path === '/api/accounts/keys' && method === 'POST') {
       return handleSetKeys(request, env, userId);
+    }
+
+    if (path === '/api/accounts/totp') {
+      if (method === 'GET') return handleGetTotpStatus(request, env, userId);
+      if (method === 'PUT' || method === 'POST') return handleSetTotpStatus(request, env, userId);
+    }
+
+    if ((path === '/api/accounts/totp/recovery-code' || path === '/api/two-factor/get-recover') && method === 'POST') {
+      return handleGetTotpRecoveryCode(request, env, userId);
     }
 
     // Revision date endpoint
@@ -383,6 +544,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Sync endpoint
     if (path === '/api/sync' && method === 'GET') {
       return handleSync(request, env, userId);
+    }
+
+    // Notifications hub (stub): now requires authentication.
+    if (path.startsWith('/notifications/')) {
+      return new Response(null, { status: 200 });
     }
 
     // Cipher endpoints
@@ -502,10 +668,40 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
     }
 
-    // Sends endpoint (stub - not implemented)
-    if (path === '/api/sends' || path.startsWith('/api/sends/')) {
-      if (method === 'GET') {
-        return jsonResponse({ data: [], object: 'list', continuationToken: null });
+    // Send endpoints
+    if (path === '/api/sends') {
+      if (method === 'GET') return handleGetSends(request, env, userId);
+      if (method === 'POST') return handleCreateSend(request, env, userId);
+    }
+
+    if ((path === '/api/sends/file/v2' || path === '/api/sends/file') && method === 'POST') {
+      return handleCreateFileSendV2(request, env, userId);
+    }
+
+    const sendMatch = path.match(/^\/api\/sends\/([^/]+)(\/.*)?$/i);
+    if (sendMatch) {
+      const sendId = sendMatch[1];
+      const subPath = sendMatch[2] || '';
+
+      if (subPath === '' || subPath === '/') {
+        if (method === 'GET') return handleGetSend(request, env, userId, sendId);
+        if (method === 'PUT') return handleUpdateSend(request, env, userId, sendId);
+        if (method === 'DELETE') return handleDeleteSend(request, env, userId, sendId);
+      }
+
+      if (subPath === '/remove-password' && (method === 'PUT' || method === 'POST')) {
+        return handleRemoveSendPassword(request, env, userId, sendId);
+      }
+
+      if (subPath === '/remove-auth' && (method === 'PUT' || method === 'POST')) {
+        return handleRemoveSendAuth(request, env, userId, sendId);
+      }
+
+      const sendFileUploadMatch = subPath.match(/^\/file\/([^/]+)\/?$/i);
+      if (sendFileUploadMatch) {
+        const fileId = sendFileUploadMatch[1];
+        if (method === 'GET') return handleGetSendFileUpload(request, env, userId, sendId, fileId);
+        if (method === 'POST' || method === 'PUT') return handleUploadSendFile(request, env, userId, sendId, fileId);
       }
     }
 
@@ -537,6 +733,50 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Devices endpoint
     if (path === '/api/devices' && method === 'GET') {
       return handleGetDevices(request, env, userId);
+    }
+
+    if (path === '/api/devices/authorized') {
+      if (method === 'GET') return handleGetAuthorizedDevices(request, env, userId);
+      if (method === 'DELETE') return handleRevokeAllTrustedDevices(request, env, userId);
+    }
+
+    const authorizedDeviceMatch = path.match(/^\/api\/devices\/authorized\/([^/]+)$/i);
+    if (authorizedDeviceMatch && method === 'DELETE') {
+      const deviceIdentifier = decodeURIComponent(authorizedDeviceMatch[1]);
+      return handleRevokeTrustedDevice(request, env, userId, deviceIdentifier);
+    }
+
+    const deleteDeviceMatch = path.match(/^\/api\/devices\/([^/]+)$/i);
+    if (deleteDeviceMatch && method === 'DELETE') {
+      const deviceIdentifier = decodeURIComponent(deleteDeviceMatch[1]);
+      return handleDeleteDevice(request, env, userId, deviceIdentifier);
+    }
+
+    // Admin endpoints
+    if (path === '/api/admin/users' && method === 'GET') {
+      return handleAdminListUsers(request, env, currentUser);
+    }
+
+    if (path === '/api/admin/invites') {
+      if (method === 'GET') return handleAdminListInvites(request, env, currentUser);
+      if (method === 'POST') return handleAdminCreateInvite(request, env, currentUser);
+      if (method === 'DELETE') return handleAdminDeleteAllInvites(request, env, currentUser);
+    }
+
+    const adminInviteMatch = path.match(/^\/api\/admin\/invites\/([^/]+)$/i);
+    if (adminInviteMatch && method === 'DELETE') {
+      const inviteCode = decodeURIComponent(adminInviteMatch[1]);
+      return handleAdminRevokeInvite(request, env, currentUser, inviteCode);
+    }
+
+    const adminUserStatusMatch = path.match(/^\/api\/admin\/users\/([a-f0-9-]+)\/status$/i);
+    if (adminUserStatusMatch && (method === 'PUT' || method === 'POST')) {
+      return handleAdminSetUserStatus(request, env, currentUser, adminUserStatusMatch[1]);
+    }
+
+    const adminUserDeleteMatch = path.match(/^\/api\/admin\/users\/([a-f0-9-]+)$/i);
+    if (adminUserDeleteMatch && method === 'DELETE') {
+      return handleAdminDeleteUser(request, env, currentUser, adminUserDeleteMatch[1]);
     }
 
     // Device push token endpoint (no-op compatibility handler)

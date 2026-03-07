@@ -5,7 +5,6 @@ const CORS_HEADERS = 'Content-Type, Authorization, Accept, Device-Type, Bitwarde
 
 function isTrustedClientOrigin(origin: string): boolean {
   // Official browser extension / desktop-webview common origins.
-  if (origin === 'null') return true;
   if (origin.startsWith('chrome-extension://')) return true;
   if (origin.startsWith('moz-extension://')) return true;
   if (origin.startsWith('safari-web-extension://')) return true;
@@ -50,6 +49,11 @@ export function applyCors(
   for (const [k, v] of Object.entries(corsHeaders)) {
     headers.set(k, v);
   }
+  // Security headers applied to every response.
+  headers.set('X-Frame-Options', 'DENY');
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  headers.set('Content-Security-Policy', "frame-ancestors 'none'");
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,

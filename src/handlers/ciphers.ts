@@ -40,6 +40,28 @@ export function normalizeCipherLoginForCompatibility(login: any): any {
   };
 }
 
+// Android 2026.2.0 requires sshKey.keyFingerprint in sync payloads.
+// Keep legacy alias "fingerprint" in parallel for older web payloads.
+export function normalizeCipherSshKeyForCompatibility(sshKey: any): any {
+  if (!sshKey || typeof sshKey !== 'object') return sshKey ?? null;
+
+  const candidate =
+    sshKey.keyFingerprint !== undefined && sshKey.keyFingerprint !== null
+      ? sshKey.keyFingerprint
+      : sshKey.fingerprint;
+
+  const normalizedFingerprint =
+    candidate === undefined || candidate === null
+      ? ''
+      : String(candidate);
+
+  return {
+    ...sshKey,
+    keyFingerprint: normalizedFingerprint,
+    fingerprint: normalizedFingerprint,
+  };
+}
+
 // Format attachments for API response
 export function formatAttachments(attachments: Attachment[]): any[] | null {
   if (attachments.length === 0) return null;
@@ -63,6 +85,7 @@ export function cipherToResponse(cipher: Cipher, attachments: Attachment[] = [])
   // Strip internal-only fields that must not appear in the API response
   const { userId, createdAt, updatedAt, deletedAt, ...passthrough } = cipher;
   const normalizedLogin = normalizeCipherLoginForCompatibility((passthrough as any).login ?? null);
+  const normalizedSshKey = normalizeCipherSshKeyForCompatibility((passthrough as any).sshKey ?? null);
 
   return {
     // Pass through ALL stored cipher fields (known + unknown)
@@ -85,6 +108,7 @@ export function cipherToResponse(cipher: Cipher, attachments: Attachment[] = [])
     collectionIds: [],
     attachments: formatAttachments(attachments),
     login: normalizedLogin,
+    sshKey: normalizedSshKey,
     encryptedFor: null,
   };
 }
@@ -144,6 +168,12 @@ export async function handleGetCipher(request: Request, env: Env, userId: string
   return jsonResponse(cipherToResponse(cipher, attachments));
 }
 
+async function verifyFolderOwnership(storage: StorageService, folderId: string | null | undefined, userId: string): Promise<boolean> {
+  if (!folderId) return true;
+  const folder = await storage.getFolder(folderId);
+  return !!(folder && folder.userId === userId);
+}
+
 // POST /api/ciphers
 export async function handleCreateCipher(request: Request, env: Env, userId: string): Promise<Response> {
   const storage = new StorageService(env.DB);
@@ -175,8 +205,15 @@ export async function handleCreateCipher(request: Request, env: Env, userId: str
     deletedAt: null,
   };
   cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+  cipher.sshKey = normalizeCipherSshKeyForCompatibility(cipher.sshKey);
   const createFields = getAliasedProp(cipherData, ['fields', 'Fields']);
   cipher.fields = createFields.present ? (createFields.value ?? null) : (cipher.fields ?? null);
+
+  // Prevent referencing a folder owned by another user.
+  if (cipher.folderId) {
+    const folderOk = await verifyFolderOwnership(storage, cipher.folderId, userId);
+    if (!folderOk) return errorResponse('Folder not found', 404);
+  }
 
   await storage.saveCipher(cipher);
   await storage.updateRevisionDate(userId);
@@ -220,6 +257,7 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     deletedAt: existingCipher.deletedAt,
   };
   cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+  cipher.sshKey = normalizeCipherSshKeyForCompatibility(cipher.sshKey);
 
   // Custom fields deletion compatibility:
   // - Accept both camelCase "fields" and PascalCase "Fields".
@@ -230,6 +268,12 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     cipher.fields = incomingFields.value ?? null;
   } else if (request.method === 'PUT' || request.method === 'POST') {
     cipher.fields = null;
+  }
+
+  // Prevent referencing a folder owned by another user.
+  if (cipher.folderId) {
+    const folderOk = await verifyFolderOwnership(storage, cipher.folderId, userId);
+    if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
   await storage.saveCipher(cipher);
@@ -331,6 +375,10 @@ export async function handlePartialUpdateCipher(request: Request, env: Env, user
   }
 
   if (body.folderId !== undefined) {
+    if (body.folderId) {
+      const folderOk = await verifyFolderOwnership(storage, body.folderId, userId);
+      if (!folderOk) return errorResponse('Folder not found', 404);
+    }
     cipher.folderId = body.folderId;
   }
   if (body.favorite !== undefined) {
@@ -357,6 +405,11 @@ export async function handleBulkMoveCiphers(request: Request, env: Env, userId: 
 
   if (!body.ids || !Array.isArray(body.ids)) {
     return errorResponse('ids array is required', 400);
+  }
+
+  if (body.folderId) {
+    const folderOk = await verifyFolderOwnership(storage, body.folderId, userId);
+    if (!folderOk) return errorResponse('Folder not found', 404);
   }
 
   await storage.bulkMoveCiphers(body.ids, body.folderId || null, userId);
